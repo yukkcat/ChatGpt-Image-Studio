@@ -94,3 +94,14 @@ func TestSaveConfigOverridesDoesNotRewriteBootstrapOnRedisFailure(t *testing.T) 
 		t.Fatalf("bootstrap override should not switch to redis on failed save: %s", string(after))
 	}
 }
+
+func TestBuildConfigPayloadIncludesPublicImageBaseURL(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.App.PublicImageBaseURL = "https://img.example.com"
+	server := &Server{cfg: cfg}
+
+	payload := server.buildConfigPayload()
+	if payload.App.PublicImageBaseURL != "https://img.example.com" {
+		t.Fatalf("PublicImageBaseURL = %q, want configured value", payload.App.PublicImageBaseURL)
+	}
+}

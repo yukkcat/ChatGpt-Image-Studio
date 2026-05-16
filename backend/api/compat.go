@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -156,7 +155,7 @@ func (s *Server) executeImageGeneration(ctx context.Context, req imageGeneration
 	if err != nil {
 		return nil, err
 	}
-	return compatTaskPayload(finalTask)
+	return s.compatTaskPayload(finalTask)
 }
 
 func normalizeGenerateImageSize(value string) string {
@@ -214,7 +213,7 @@ func (s *Server) executeImageEdit(ctx context.Context, req imageEditRequest, r *
 	if err != nil {
 		return nil, err
 	}
-	return compatTaskPayload(finalTask)
+	return s.compatTaskPayload(finalTask)
 }
 
 func (s *Server) executeImageSelectionEdit(ctx context.Context, req imageSelectionEditRequest, r *http.Request) (map[string]any, error) {
@@ -265,7 +264,7 @@ func (s *Server) executeImageSelectionEdit(ctx context.Context, req imageSelecti
 	if err != nil {
 		return nil, err
 	}
-	return compatTaskPayload(finalTask)
+	return s.compatTaskPayload(finalTask)
 }
 
 func (s *Server) handleImageChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -384,7 +383,7 @@ func (s *Server) runCompatImageRequest(ctx context.Context, r *http.Request, req
 	}, r)
 }
 
-func compatTaskPayload(task *imageTaskView) (map[string]any, error) {
+func (s *Server) compatTaskPayload(task *imageTaskView) (map[string]any, error) {
 	if task == nil {
 		return nil, fmt.Errorf("image task not found")
 	}
@@ -416,7 +415,7 @@ func compatTaskPayload(task *imageTaskView) (map[string]any, error) {
 			item["b64_json"] = strings.TrimSpace(image.B64JSON)
 			data = append(data, item)
 		case strings.TrimSpace(image.URL) != "":
-			item["url"] = strings.TrimSpace(image.URL)
+			item["url"] = s.publicImageURL(image.URL)
 			data = append(data, item)
 		default:
 			message := firstNonEmpty(strings.TrimSpace(image.Error), strings.TrimSpace(task.Error), "image generation failed")
@@ -602,32 +601,12 @@ func resolveCompatRemoteURL(rawURL string, r *http.Request) (string, error) {
 		return "", fmt.Errorf("invalid image url")
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return "", fmt.Errorf("only data urls and same-origin image urls are supported")
+		return "", fmt.Errorf("only data urls and http image urls are supported")
 	}
-
-	requestAuthority := normalizeCompatAuthority(r.Host)
-	if forwardedHost := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Host"), ",")[0]); forwardedHost != "" {
-		requestAuthority = normalizeCompatAuthority(forwardedHost)
-	}
-	targetAuthority := normalizeCompatAuthority(parsed.Host)
-	if targetAuthority == "" {
+	if strings.TrimSpace(parsed.Host) == "" {
 		return "", fmt.Errorf("invalid image url")
 	}
-	if requestAuthority != "" && requestAuthority == targetAuthority {
-		return parsed.String(), nil
-	}
-	return "", fmt.Errorf("only data urls and same-origin image urls are supported")
-}
-
-func normalizeCompatAuthority(rawHost string) string {
-	authority := strings.TrimSpace(rawHost)
-	if authority == "" {
-		return ""
-	}
-	if parsedHost, parsedPort, err := net.SplitHostPort(authority); err == nil {
-		return strings.ToLower(net.JoinHostPort(strings.Trim(parsedHost, "[]"), parsedPort))
-	}
-	return strings.ToLower(strings.Trim(authority, "[]"))
+	return parsed.String(), nil
 }
 
 func decodeCompatDataURL(raw string) ([]byte, error) {

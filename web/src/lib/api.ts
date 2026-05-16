@@ -270,6 +270,7 @@ export type ConfigPayload = {
     apiKey: string;
     authKey: string;
     imageFormat: string;
+    publicImageBaseUrl: string;
     maxUploadSizeMB: number;
   };
   server: {

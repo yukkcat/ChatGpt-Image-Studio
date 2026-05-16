@@ -66,6 +66,7 @@ function defaultConfigPayload(): ConfigPayload {
       apiKey: "",
       authKey: "",
       imageFormat: "url",
+      publicImageBaseUrl: "",
       maxUploadSizeMB: 50,
     },
     server: {

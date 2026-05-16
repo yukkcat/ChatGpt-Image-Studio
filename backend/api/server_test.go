@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,6 +17,12 @@ import (
 	"chatgpt2api/internal/config"
 	"chatgpt2api/internal/imagehistory"
 )
+
+type apiRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn apiRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
+}
 
 func TestShouldUseOfficialResponses(t *testing.T) {
 	tests := []struct {
@@ -378,6 +385,131 @@ func TestResolveImageAcquireError(t *testing.T) {
 				t.Fatalf("resolveImageAcquireError() code = %q, want %q", requestErrorCode(got), tt.wantCode)
 			}
 		})
+	}
+}
+
+func TestHandleImageEditsJSONAcceptsBase64Images(t *testing.T) {
+	server, recorder := newImageModeCompatTestServerWithOptions(t, imageModeCompatScenario{
+		imageMode:   "studio",
+		accountType: "Free",
+		freeRoute:   "legacy",
+		freeModel:   "auto",
+		paidRoute:   "responses",
+		paidModel:   "gpt-5.4-mini",
+	}, compatTestServerOptions{})
+
+	image := base64.StdEncoding.EncodeToString([]byte("json-image"))
+	body := `{
+		"model":"gpt-image-2",
+		"prompt":"edit from json base64",
+		"response_format":"b64_json",
+		"images":[{"b64_json":"` + image + `"}]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+server.cfg.App.APIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+
+	assertCompatResponse(t, rec, http.StatusOK, "")
+	if recorder.lastFactory != "official" {
+		t.Fatalf("last factory = %q, want official", recorder.lastFactory)
+	}
+	if got := recorder.callSequence[len(recorder.callSequence)-1]; got != "official:token-compat:edit" {
+		t.Fatalf("last call = %q, want official edit", got)
+	}
+}
+
+func TestHandleImageEditsJSONAcceptsExternalImageURLs(t *testing.T) {
+	server, recorder := newImageModeCompatTestServerWithOptions(t, imageModeCompatScenario{
+		imageMode:   "studio",
+		accountType: "Free",
+		freeRoute:   "legacy",
+		freeModel:   "auto",
+		paidRoute:   "responses",
+		paidModel:   "gpt-5.4-mini",
+	}, compatTestServerOptions{})
+
+	oldTransport := imageEditDownloadTransport
+	imageEditDownloadTransport = apiRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Host != "example.com" {
+			t.Fatalf("download host = %q, want example.com", req.URL.Host)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"image/png"}},
+			Body:       io.NopCloser(strings.NewReader("\x89PNG\r\n\x1a\nimage")),
+			Request:    req,
+		}, nil
+	})
+	defer func() {
+		imageEditDownloadTransport = oldTransport
+	}()
+
+	body := `{
+		"model":"gpt-image-2",
+		"prompt":"combine external urls",
+		"response_format":"b64_json",
+		"images":[
+			{"image_url":"https://example.com/cat.png"},
+			"https://example.com/dog.png"
+		]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+server.cfg.App.APIKey)
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+
+	assertCompatResponse(t, rec, http.StatusOK, "")
+	if recorder.lastFactory != "official" {
+		t.Fatalf("last factory = %q, want official", recorder.lastFactory)
+	}
+}
+
+func TestHandleImageEditsJSONAcceptsLoopbackImageURLs(t *testing.T) {
+	server, recorder := newImageModeCompatTestServerWithOptions(t, imageModeCompatScenario{
+		imageMode:   "studio",
+		accountType: "Free",
+		freeRoute:   "legacy",
+		freeModel:   "auto",
+		paidRoute:   "responses",
+		paidModel:   "gpt-5.4-mini",
+	}, compatTestServerOptions{})
+
+	oldTransport := imageEditDownloadTransport
+	imageEditDownloadTransport = apiRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Host != "127.0.0.1:7000" {
+			t.Fatalf("download host = %q, want 127.0.0.1:7000", req.URL.Host)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"text/plain"}},
+			Body:       io.NopCloser(strings.NewReader("local-image-bytes")),
+			Request:    req,
+		}, nil
+	})
+	defer func() {
+		imageEditDownloadTransport = oldTransport
+	}()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(`{
+		"model":"gpt-image-2",
+		"prompt":"loopback url",
+		"response_format":"b64_json",
+		"images":[{"image_url":"http://127.0.0.1:7000/secret.png"}]
+	}`))
+	req.Header.Set("Authorization", "Bearer "+server.cfg.App.APIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+
+	assertCompatResponse(t, rec, http.StatusOK, "")
+	if recorder.lastFactory != "official" {
+		t.Fatalf("last factory = %q, want official", recorder.lastFactory)
 	}
 }
 

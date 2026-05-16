@@ -77,12 +77,16 @@ func TestExtractCompatPromptAndImagesFromResponsesInput(t *testing.T) {
 	}
 }
 
-func TestResolveCompatRemoteURLRejectsNonSameOriginLoopback(t *testing.T) {
+func TestResolveCompatRemoteURLAllowsExternalLoopback(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "http://example.com/v1/responses", nil)
 	req.Host = "example.com"
 
-	if _, err := resolveCompatRemoteURL("http://127.0.0.1:7000/v1/files/image/test.png", req); err == nil {
-		t.Fatal("expected loopback url to be rejected when request host is different")
+	got, err := resolveCompatRemoteURL("http://127.0.0.1:7000/v1/files/image/test.png", req)
+	if err != nil {
+		t.Fatalf("resolveCompatRemoteURL returned error: %v", err)
+	}
+	if got != "http://127.0.0.1:7000/v1/files/image/test.png" {
+		t.Fatalf("resolveCompatRemoteURL = %q, want external url", got)
 	}
 }
 
@@ -298,7 +302,8 @@ func TestBuildCompatResponsesResponse(t *testing.T) {
 }
 
 func TestCompatTaskPayloadKeepsPartialSuccess(t *testing.T) {
-	payload, err := compatTaskPayload(&imageTaskView{
+	server := &Server{cfg: &config.Config{}}
+	payload, err := server.compatTaskPayload(&imageTaskView{
 		ID:        "compat-task-1",
 		Status:    imageTaskStatusFailed,
 		CreatedAt: "2026-04-27T10:00:00Z",
@@ -345,8 +350,41 @@ func TestCompatTaskPayloadKeepsPartialSuccess(t *testing.T) {
 	}
 }
 
+func TestCompatTaskPayloadUsesPublicImageBaseURL(t *testing.T) {
+	server := &Server{cfg: &config.Config{}}
+	server.cfg.App.PublicImageBaseURL = "https://img.example.com/"
+
+	payload, err := server.compatTaskPayload(&imageTaskView{
+		ID:        "compat-task-public-url",
+		Status:    imageTaskStatusSucceeded,
+		CreatedAt: "2026-04-27T10:00:00Z",
+		Images: []imagehistory.Image{
+			{
+				ID:     "img-ok",
+				Status: "success",
+				URL:    "/v1/files/image/success.png",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("compatTaskPayload() returned error: %v", err)
+	}
+
+	data, ok := payload["data"].([]map[string]any)
+	if !ok {
+		t.Fatalf("data type = %T, want []map[string]any", payload["data"])
+	}
+	if len(data) != 1 {
+		t.Fatalf("len(data) = %d, want 1", len(data))
+	}
+	if got := stringValue(data[0]["url"]); got != "https://img.example.com/v1/files/image/success.png" {
+		t.Fatalf("data[0].url = %q, want public image url", got)
+	}
+}
+
 func TestCompatTaskPayloadReturnsErrorWhenAllUnitsFail(t *testing.T) {
-	_, err := compatTaskPayload(&imageTaskView{
+	server := &Server{cfg: &config.Config{}}
+	_, err := server.compatTaskPayload(&imageTaskView{
 		ID:        "compat-task-2",
 		Status:    imageTaskStatusFailed,
 		CreatedAt: "2026-04-27T10:00:00Z",

@@ -32,12 +32,13 @@ type Paths struct {
 }
 
 type AppConfig struct {
-	Name            string `toml:"name"`
-	Version         string `toml:"version"`
-	APIKey          string `toml:"api_key"`
-	AuthKey         string `toml:"auth_key"`
-	ImageFormat     string `toml:"image_format"`
-	MaxUploadSizeMB int    `toml:"max_upload_size_mb"`
+	Name               string `toml:"name"`
+	Version            string `toml:"version"`
+	APIKey             string `toml:"api_key"`
+	AuthKey            string `toml:"auth_key"`
+	ImageFormat        string `toml:"image_format"`
+	PublicImageBaseURL string `toml:"public_image_base_url"`
+	MaxUploadSizeMB    int    `toml:"max_upload_size_mb"`
 }
 
 type ServerConfig struct {

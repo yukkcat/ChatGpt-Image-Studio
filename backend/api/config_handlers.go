@@ -13,12 +13,13 @@ import (
 
 type configPayload struct {
 	App struct {
-		Name            string `json:"name"`
-		Version         string `json:"version"`
-		APIKey          string `json:"apiKey"`
-		AuthKey         string `json:"authKey"`
-		ImageFormat     string `json:"imageFormat"`
-		MaxUploadSizeMB int    `json:"maxUploadSizeMB"`
+		Name               string `json:"name"`
+		Version            string `json:"version"`
+		APIKey             string `json:"apiKey"`
+		AuthKey            string `json:"authKey"`
+		ImageFormat        string `json:"imageFormat"`
+		PublicImageBaseURL string `json:"publicImageBaseUrl"`
+		MaxUploadSizeMB    int    `json:"maxUploadSizeMB"`
 	} `json:"app"`
 	Server struct {
 		Host                     string `json:"host"`
@@ -138,12 +139,13 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 
 	overrides := map[string]map[string]any{
 		"app": {
-			"name":               payload.App.Name,
-			"version":            payload.App.Version,
-			"api_key":            payload.App.APIKey,
-			"auth_key":           payload.App.AuthKey,
-			"image_format":       payload.App.ImageFormat,
-			"max_upload_size_mb": payload.App.MaxUploadSizeMB,
+			"name":                  payload.App.Name,
+			"version":               payload.App.Version,
+			"api_key":               payload.App.APIKey,
+			"auth_key":              payload.App.AuthKey,
+			"image_format":          payload.App.ImageFormat,
+			"public_image_base_url": payload.App.PublicImageBaseURL,
+			"max_upload_size_mb":    payload.App.MaxUploadSizeMB,
 		},
 		"server": {
 			"host":                         payload.Server.Host,
@@ -269,6 +271,7 @@ func (s *Server) buildConfigPayloadFromConfig(cfg *config.Config) configPayload 
 	payload.App.APIKey = cfg.App.APIKey
 	payload.App.AuthKey = cfg.App.AuthKey
 	payload.App.ImageFormat = cfg.App.ImageFormat
+	payload.App.PublicImageBaseURL = cfg.App.PublicImageBaseURL
 	payload.App.MaxUploadSizeMB = cfg.App.MaxUploadSizeMB
 
 	payload.Server.Host = cfg.Server.Host

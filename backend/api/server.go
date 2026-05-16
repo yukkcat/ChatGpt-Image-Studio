@@ -73,6 +73,9 @@ type accountRefreshRunResult struct {
 
 const cpaFixedImageModel = "gpt-image-2"
 const maxBulkAccountRefreshWorkers = 4
+const imageEditDownloadTimeout = 20 * time.Second
+
+var imageEditDownloadTransport = http.DefaultTransport
 
 func (e *requestError) Error() string {
 	return firstNonEmpty(e.message, e.code)
@@ -847,6 +850,11 @@ func (s *Server) handleImageGenerations(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleImageEdits(w http.ResponseWriter, r *http.Request) {
+	if isJSONContentType(r.Header.Get("Content-Type")) {
+		s.handleImageEditsJSON(w, r)
+		return
+	}
+
 	if err := r.ParseMultipartForm(int64(max(1, s.cfg.App.MaxUploadSizeMB)) << 20); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid multipart form"})
 		return
@@ -927,6 +935,245 @@ func (s *Server) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"created": time.Now().Unix(), "data": data})
+}
+
+type imageEditJSONRequest struct {
+	Model          string               `json:"model"`
+	Prompt         string               `json:"prompt"`
+	Image          any                  `json:"image"`
+	Images         any                  `json:"images"`
+	ImageBase64    any                  `json:"image_base64"`
+	ImageBase64Alt any                  `json:"imageBase64"`
+	MaskImage      any                  `json:"mask_image"`
+	MaskBase64     any                  `json:"mask_base64"`
+	Mask           any                  `json:"mask"`
+	Size           string               `json:"size"`
+	Quality        string               `json:"quality"`
+	ResponseFormat string               `json:"response_format"`
+	Input          []imageEditJSONInput `json:"input"`
+}
+
+type imageEditJSONInput struct {
+	ImageURL string `json:"image_url"`
+	URL      string `json:"url"`
+	FileID   string `json:"file_id"`
+	B64JSON  string `json:"b64_json"`
+	Base64   string `json:"base64"`
+	DataURL  string `json:"data_url"`
+}
+
+func (s *Server) handleImageEditsJSON(w http.ResponseWriter, r *http.Request) {
+	var req imageEditJSONRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid request body"})
+		return
+	}
+
+	prompt := strings.TrimSpace(req.Prompt)
+	if prompt == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "prompt is required"})
+		return
+	}
+
+	images, err := s.readImagesFromJSON(r.Context(), req)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, requestErrorCode(err), err.Error())
+		return
+	}
+	if len(images) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "at least one image is required"})
+		return
+	}
+
+	mask, err := s.readOptionalJSONMask(r.Context(), req.Mask, req.MaskImage, req.MaskBase64)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, requestErrorCode(err), err.Error())
+		return
+	}
+
+	payload, err := s.executeImageEdit(r.Context(), imageEditRequest{
+		Model:          normalizeRequestedImageModel(req.Model, s.cfg.ChatGPT.Model),
+		Prompt:         prompt,
+		Images:         images,
+		Mask:           mask,
+		Size:           strings.TrimSpace(req.Size),
+		Quality:        strings.TrimSpace(req.Quality),
+		ResponseFormat: firstNonEmpty(req.ResponseFormat, s.cfg.App.ImageFormat, "url"),
+	}, r)
+	if err != nil {
+		writeImageRequestError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func (s *Server) readImagesFromJSON(ctx context.Context, req imageEditJSONRequest) ([][]byte, error) {
+	items := make([]imageEditJSONInput, 0)
+	items = append(items, collectImageEditJSONInputs(req.Images)...)
+	items = append(items, collectImageEditJSONInputs(req.Image)...)
+	items = append(items, collectImageEditJSONInputs(req.ImageBase64)...)
+	items = append(items, collectImageEditJSONInputs(req.ImageBase64Alt)...)
+	items = append(items, req.Input...)
+
+	images := make([][]byte, 0, len(items))
+	for _, item := range items {
+		data, err := s.readImageEditJSONInput(ctx, item)
+		if err != nil {
+			return nil, err
+		}
+		images = append(images, data)
+	}
+	return images, nil
+}
+
+func collectImageEditJSONInputs(value any) []imageEditJSONInput {
+	switch typed := value.(type) {
+	case nil:
+		return nil
+	case string:
+		if strings.TrimSpace(typed) == "" {
+			return nil
+		}
+		item := imageEditJSONInput{}
+		if isHTTPImageReference(typed) {
+			item.ImageURL = typed
+		} else {
+			item.Base64 = typed
+		}
+		return []imageEditJSONInput{item}
+	case []any:
+		items := make([]imageEditJSONInput, 0, len(typed))
+		for _, item := range typed {
+			items = append(items, collectImageEditJSONInputs(item)...)
+		}
+		return items
+	case []string:
+		items := make([]imageEditJSONInput, 0, len(typed))
+		for _, item := range typed {
+			items = append(items, collectImageEditJSONInputs(item)...)
+		}
+		return items
+	case []imageEditJSONInput:
+		return typed
+	case map[string]any:
+		item := imageEditJSONInput{
+			ImageURL: firstNonEmpty(
+				stringValue(typed["image_url"]),
+				stringValue(typed["imageURL"]),
+				stringValue(typed["imageUrl"]),
+				stringValue(typed["url"]),
+			),
+			URL:     stringValue(typed["url"]),
+			FileID:  stringValue(typed["file_id"]),
+			B64JSON: stringValue(typed["b64_json"]),
+			Base64: firstNonEmpty(
+				stringValue(typed["base64"]),
+				stringValue(typed["image_base64"]),
+				stringValue(typed["imageBase64"]),
+			),
+			DataURL: firstNonEmpty(
+				stringValue(typed["data_url"]),
+				stringValue(typed["dataUrl"]),
+			),
+		}
+		return []imageEditJSONInput{item}
+	default:
+		return nil
+	}
+}
+
+func (s *Server) readImageEditJSONInput(ctx context.Context, item imageEditJSONInput) ([]byte, error) {
+	for _, raw := range []string{item.ImageURL, item.URL, item.DataURL, item.B64JSON, item.Base64} {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			continue
+		}
+		if isHTTPImageReference(value) {
+			return s.downloadExternalImageForEdit(ctx, value)
+		}
+		data, err := decodeBase64Image(value)
+		if err != nil {
+			return nil, newRequestError("invalid_image_input", err.Error())
+		}
+		return data, nil
+	}
+	if strings.TrimSpace(item.FileID) != "" {
+		return nil, newRequestError("unsupported_image_input", "file_id image inputs are not supported by this endpoint")
+	}
+	return nil, newRequestError("invalid_image_input", "image input must include image_url, url, b64_json, base64, or data_url")
+}
+
+func isHTTPImageReference(value string) bool {
+	lower := strings.ToLower(strings.TrimSpace(value))
+	return strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")
+}
+
+func (s *Server) readOptionalJSONMask(ctx context.Context, values ...any) ([]byte, error) {
+	items := make([]imageEditJSONInput, 0)
+	for _, value := range values {
+		items = append(items, collectImageEditJSONInputs(value)...)
+	}
+	if len(items) == 0 {
+		return nil, nil
+	}
+	if len(items) > 1 {
+		return nil, newRequestError("invalid_mask_input", "mask must contain exactly one image")
+	}
+	return s.readImageEditJSONInput(ctx, items[0])
+}
+
+func (s *Server) downloadExternalImageForEdit(ctx context.Context, rawURL string) ([]byte, error) {
+	resolvedURL := strings.TrimSpace(rawURL)
+	if !isHTTPImageReference(resolvedURL) {
+		return nil, newRequestError("invalid_image_url", "image url must use http or https")
+	}
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, imageEditDownloadTimeout)
+	defer cancel()
+
+	client := &http.Client{
+		Transport: imageEditDownloadTransport,
+		Timeout:   imageEditDownloadTimeout,
+	}
+
+	request, err := http.NewRequestWithContext(timeoutCtx, http.MethodGet, resolvedURL, nil)
+	if err != nil {
+		return nil, newRequestError("invalid_image_url", "invalid image url")
+	}
+	request.Header.Set("Accept", "image/png,image/jpeg,image/webp,image/gif;q=0.8,*/*;q=0.1")
+
+	response, err := client.Do(request)
+	if err != nil {
+		if requestErrorCode(err) != "" {
+			return nil, err
+		}
+		return nil, newRequestError("image_download_failed", "download image failed")
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil, newRequestError("image_download_failed", fmt.Sprintf("download image returned status %d", response.StatusCode))
+	}
+
+	maxBytes := int64(max(1, s.cfg.App.MaxUploadSizeMB)) << 20
+	limited := io.LimitReader(response.Body, maxBytes+1)
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, newRequestError("image_download_failed", "read image failed")
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, newRequestError("image_too_large", fmt.Sprintf("image exceeds max_upload_size_mb limit of %d MB", max(1, s.cfg.App.MaxUploadSizeMB)))
+	}
+	if len(data) == 0 {
+		return nil, newRequestError("invalid_image_input", "image is empty")
+	}
+
+	return data, nil
+}
+
+func isJSONContentType(value string) bool {
+	mediaType := strings.ToLower(strings.TrimSpace(strings.Split(value, ";")[0]))
+	return mediaType == "application/json"
 }
 
 type imageRequestMetadata struct {
@@ -1207,7 +1454,7 @@ func (s *Server) runPureCPAImageRequest(
 	}
 	metadata.applyTo(&entry)
 	s.logImageRequest(entry)
-	return buildImageResponse(r, client, results, responseFormat, "", s.cfg.ResolvePath(s.cfg.Storage.ImageDir)), nil
+	return s.buildImageResponse(r, client, results, responseFormat, "", s.cfg.ResolvePath(s.cfg.Storage.ImageDir)), nil
 }
 
 func (s *Server) runImageRequest(ctx context.Context, authFile *accounts.LocalAuth, account accounts.PublicAccount, releaseLease func(), routingDecision accounts.ImageAccountRoutingDecision, operation, responseFormat string, preferredAccount bool, requestedModel string, responsesEligible bool, metadata imageRequestMetadata, run func(client imageWorkflowClient, upstreamModel string) ([]handler.ImageResult, error), r *http.Request) ([]map[string]any, bool, error) {
@@ -1472,7 +1719,7 @@ func (s *Server) runImageRequestWithAdmission(ctx context.Context, authFile *acc
 	applyImageRoutingLogFields(routingDecision, &entry)
 	metadata.applyTo(&entry)
 	s.logImageRequest(entry)
-	return buildImageResponse(r, client, results, responseFormat, account.ID, s.cfg.ResolvePath(s.cfg.Storage.ImageDir)), false, nil
+	return s.buildImageResponse(r, client, results, responseFormat, account.ID, s.cfg.ResolvePath(s.cfg.Storage.ImageDir)), false, nil
 }
 
 func normalizeRequestedImageModel(requested, fallback string) string {

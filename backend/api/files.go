@@ -48,14 +48,34 @@ func downloadAndCache(client imageDownloader, upstreamURL string, cacheDir strin
 	return filename, nil
 }
 
-// gatewayImageURL builds the public URL for a cached image.
-func gatewayImageURL(r *http.Request, filename string) string {
+func (s *Server) publicImageURL(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || s == nil || s.cfg == nil {
+		return trimmed
+	}
+	if strings.HasPrefix(strings.ToLower(trimmed), "http://") || strings.HasPrefix(strings.ToLower(trimmed), "https://") {
+		return trimmed
+	}
+	if !strings.HasPrefix(trimmed, "/v1/files/image/") {
+		return trimmed
+	}
+	baseURL := strings.TrimRight(strings.TrimSpace(s.cfg.App.PublicImageBaseURL), "/")
+	if baseURL == "" {
+		return trimmed
+	}
+	return baseURL + trimmed
+}
+
+func (s *Server) cachedImageURL(r *http.Request, filename string) string {
+	relative := "/v1/files/image/" + filename
+	if strings.TrimSpace(s.cfg.App.PublicImageBaseURL) != "" {
+		return s.publicImageURL(relative)
+	}
 	scheme := "http"
 	if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
 		scheme = "https"
 	}
-	host := r.Host
-	return fmt.Sprintf("%s://%s/v1/files/image/%s", scheme, host, filename)
+	return fmt.Sprintf("%s://%s%s", scheme, r.Host, relative)
 }
 
 func (s *Server) resolveImageFilePath(name string) string {

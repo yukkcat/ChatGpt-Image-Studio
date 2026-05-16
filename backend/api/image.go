@@ -10,7 +10,7 @@ import (
 
 // buildImageResponse converts ImageResults to the OpenAI-compatible response format.
 // Only includes url/b64_json and revised_prompt — no internal ChatGPT fields.
-func buildImageResponse(r *http.Request, client imageDownloader, results []handler.ImageResult, responseFormat string, sourceAccountID string, cacheDir string) []map[string]any {
+func (s *Server) buildImageResponse(r *http.Request, client imageDownloader, results []handler.ImageResult, responseFormat string, sourceAccountID string, cacheDir string) []map[string]any {
 	return buildImageResponseItems(
 		r.Context(),
 		client,
@@ -19,7 +19,7 @@ func buildImageResponse(r *http.Request, client imageDownloader, results []handl
 		sourceAccountID,
 		cacheDir,
 		func(filename string) string {
-			return gatewayImageURL(r, filename)
+			return s.cachedImageURL(r, filename)
 		},
 	)
 }

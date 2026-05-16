@@ -254,6 +254,17 @@ export function RuntimeSection({ config, setSection }: RuntimeSectionProps) {
         />
       </Field>
       <Field
+        label="图片公开访问域名"
+        hint="用于把 /v1/files/image/... 补全成完整 URL，例如 https://example.com。留空时保持当前相对路径。"
+      >
+        <Input
+          value={config.app.publicImageBaseUrl}
+          onChange={(event) => setSection("app", { ...config.app, publicImageBaseUrl: event.target.value })}
+          placeholder="https://example.com"
+          className="h-11 rounded-2xl border-stone-200 bg-white shadow-none"
+        />
+      </Field>
+      <Field
         label="最大上传大小（MB）"
         hint="当前项目图片上传的最大体积限制。"
         tooltip={
