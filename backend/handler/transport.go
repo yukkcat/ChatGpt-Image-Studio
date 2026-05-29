@@ -14,7 +14,7 @@ import (
 )
 
 // newChromeTransport returns an http.RoundTripper that mimics Chrome's TLS fingerprint
-// and properly supports HTTP/2.
+// and HTTP/2 behavior to pass Cloudflare's bot detection.
 func newChromeTransport(proxyURL ...string) http.RoundTripper {
 	configuredProxyURL := firstProxyURL(proxyURL...)
 	fallbackTransport, err := outboundproxy.NewHTTPTransport(configuredProxyURL)
@@ -48,15 +48,25 @@ func (t *chromeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	host := req.URL.Hostname()
 
-	// Each request gets its own TLS + HTTP/2 connection.
-	// This avoids hitting the server's per-connection concurrent stream limit
-	// which causes EOF errors under high concurrency.
+	// Each request gets its own TLS connection with Chrome fingerprint.
 	conn, err := t.dialTLS(req.Context(), addr, host)
 	if err != nil {
 		return nil, err
 	}
 
-	tr := &http2.Transport{}
+	// Use http2.Transport with custom settings matching Chrome's SETTINGS frame.
+	tr := &http2.Transport{
+		// Chrome sends these initial settings:
+		// HEADER_TABLE_SIZE = 65536
+		// ENABLE_PUSH = 0
+		// INITIAL_WINDOW_SIZE = 6291456
+		// MAX_HEADER_LIST_SIZE = 262144
+		MaxHeaderListSize:          262144,
+		MaxDecoderHeaderTableSize:  65536,
+		MaxEncoderHeaderTableSize:  65536,
+		StrictMaxConcurrentStreams: false,
+	}
+
 	cc, err := tr.NewClientConn(conn)
 	if err != nil {
 		conn.Close()
@@ -69,13 +79,10 @@ func (t *chromeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 
-	// Wrap response body to close the underlying connection when done reading.
 	resp.Body = &connClosingBody{ReadCloser: resp.Body, conn: conn}
 	return resp, nil
 }
 
-// connClosingBody wraps a response body and closes the underlying TCP connection
-// when the body is closed.
 type connClosingBody struct {
 	ReadCloser interface {
 		Read([]byte) (int, error)
@@ -97,18 +104,32 @@ func (b *connClosingBody) Close() error {
 }
 
 func (t *chromeTransport) dialTLS(ctx context.Context, addr, host string) (net.Conn, error) {
-	conn, err := t.tunnelDial(ctx, "tcp", addr)
+	rawConn, err := t.tunnelDial(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
 
-	tlsConn := utls.UClient(conn, &utls.Config{
+	// Use latest Chrome fingerprint for realistic TLS ClientHello.
+	// HelloChrome_131 includes proper cipher suites, extensions, key shares,
+	// and ALPN that match a real Chrome browser.
+	spec, err := utls.UTLSIdToSpec(utls.HelloChrome_131)
+	if err != nil {
+		// Fallback to auto if specific version not available
+		spec, _ = utls.UTLSIdToSpec(utls.HelloChrome_Auto)
+	}
+
+	tlsConn := utls.UClient(rawConn, &utls.Config{
 		ServerName: host,
 		NextProtos: []string{"h2", "http/1.1"},
-	}, utls.HelloChrome_Auto)
+	}, utls.HelloCustom)
+
+	if err := tlsConn.ApplyPreset(&spec); err != nil {
+		rawConn.Close()
+		return nil, fmt.Errorf("apply chrome tls preset: %w", err)
+	}
 
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		conn.Close()
+		rawConn.Close()
 		return nil, err
 	}
 
