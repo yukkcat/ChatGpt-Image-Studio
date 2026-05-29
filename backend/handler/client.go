@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -718,6 +719,32 @@ func (c *ChatGPTClient) doFConversation(ctx context.Context, body map[string]any
 }
 
 func (c *ChatGPTClient) doConversationRequest(ctx context.Context, body map[string]any, path, routeLabel string) ([]ImageResult, error) {
+	const maxRetries = 3
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(attempt) * 2 * time.Second
+			log.Printf("[%s] attempt %d failed (%v), retrying in %v...", routeLabel, attempt, lastErr, backoff)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+
+		results, err := c.doConversationRequestOnce(ctx, body, path, routeLabel)
+		if err == nil {
+			return results, nil
+		}
+		lastErr = err
+		if !isRetryableError(err) {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+func (c *ChatGPTClient) doConversationRequestOnce(ctx context.Context, body map[string]any, path, routeLabel string) ([]ImageResult, error) {
 	requestContext := extractConversationRequestContext(body)
 
 	// Step 1: Get sentinel chat-requirements token + PoW challenge
@@ -745,16 +772,44 @@ func (c *ChatGPTClient) doConversationRequest(ctx context.Context, body map[stri
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode >= 500 {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		return nil, fmt.Errorf("%s returned %d: %s", routeLabel, resp.StatusCode, string(respBody))
+	}
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return nil, &nonRetryableError{msg: fmt.Sprintf("%s returned %d: %s", routeLabel, resp.StatusCode, string(respBody))}
 	}
 
 	return c.parseSSE(ctx, resp.Body, requestContext)
 }
 
 // getSentinelTokens fetches the chat-requirements token and solves PoW if needed.
+// Retries up to 3 times on transient network errors (EOF, timeout, 5xx).
 func (c *ChatGPTClient) getSentinelTokens(ctx context.Context) (chatToken, proofToken string, err error) {
+	const maxRetries = 3
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		chatToken, proofToken, err = c.doGetSentinelTokens(ctx)
+		if err == nil {
+			return chatToken, proofToken, nil
+		}
+		if !isRetryableError(err) {
+			return "", "", err
+		}
+		if attempt < maxRetries {
+			backoff := time.Duration(attempt+1) * 2 * time.Second
+			log.Printf("[sentinel] attempt %d failed (%v), retrying in %v...", attempt+1, err, backoff)
+			select {
+			case <-ctx.Done():
+				return "", "", ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+	}
+	return "", "", err
+}
+
+func (c *ChatGPTClient) doGetSentinelTokens(ctx context.Context) (chatToken, proofToken string, err error) {
 	reqToken := generateRequirementsToken()
 
 	reqBody, _ := json.Marshal(map[string]string{"p": reqToken})
@@ -767,9 +822,13 @@ func (c *ChatGPTClient) getSentinelTokens(ctx context.Context) (chatToken, proof
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode >= 500 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		return "", "", fmt.Errorf("chat-requirements returned %d: %s", resp.StatusCode, string(body))
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return "", "", &nonRetryableError{msg: fmt.Sprintf("chat-requirements returned %d: %s", resp.StatusCode, string(body))}
 	}
 
 	var result struct {
@@ -798,6 +857,29 @@ func (c *ChatGPTClient) getSentinelTokens(ctx context.Context) (chatToken, proof
 
 	return chatToken, proofToken, nil
 }
+
+// isRetryableError returns true for transient errors (EOF, timeout, connection reset).
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var nre *nonRetryableError
+	if errors.As(err, &nre) {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "eof") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "refused") ||
+		strings.Contains(msg, "returned 5")
+}
+
+type nonRetryableError struct {
+	msg string
+}
+
+func (e *nonRetryableError) Error() string { return e.msg }
 
 func (c *ChatGPTClient) parseSSE(ctx context.Context, reader io.Reader, requestContext conversationRequestContext) ([]ImageResult, error) {
 	scanner := bufio.NewScanner(reader)

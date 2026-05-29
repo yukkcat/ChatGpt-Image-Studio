@@ -6,7 +6,6 @@ import (
 	"net"
 	"net/http"
 	"strings"
-	"sync"
 
 	"chatgpt2api/internal/outboundproxy"
 
@@ -34,8 +33,6 @@ func newChromeTransport(proxyURL ...string) http.RoundTripper {
 }
 
 type chromeTransport struct {
-	mu         sync.Mutex
-	h2Conns    map[string]*http2.ClientConn
 	fallback   http.RoundTripper
 	tunnelDial func(context.Context, string, string) (net.Conn, error)
 }
@@ -51,40 +48,52 @@ func (t *chromeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	host := req.URL.Hostname()
 
-	t.mu.Lock()
-	if t.h2Conns == nil {
-		t.h2Conns = make(map[string]*http2.ClientConn)
-	}
-	cc, ok := t.h2Conns[addr]
-	if ok {
-		// Check if connection is still usable
-		if cc.CanTakeNewRequest() {
-			t.mu.Unlock()
-			return cc.RoundTrip(req)
-		}
-		delete(t.h2Conns, addr)
-	}
-	t.mu.Unlock()
-
-	// Establish new connection
+	// Each request gets its own TLS + HTTP/2 connection.
+	// This avoids hitting the server's per-connection concurrent stream limit
+	// which causes EOF errors under high concurrency.
 	conn, err := t.dialTLS(req.Context(), addr, host)
 	if err != nil {
 		return nil, err
 	}
 
-	// Create HTTP/2 client connection
 	tr := &http2.Transport{}
-	newCC, err := tr.NewClientConn(conn)
+	cc, err := tr.NewClientConn(conn)
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("http2 client conn: %w", err)
 	}
 
-	t.mu.Lock()
-	t.h2Conns[addr] = newCC
-	t.mu.Unlock()
+	resp, err := cc.RoundTrip(req)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
 
-	return newCC.RoundTrip(req)
+	// Wrap response body to close the underlying connection when done reading.
+	resp.Body = &connClosingBody{ReadCloser: resp.Body, conn: conn}
+	return resp, nil
+}
+
+// connClosingBody wraps a response body and closes the underlying TCP connection
+// when the body is closed.
+type connClosingBody struct {
+	ReadCloser interface {
+		Read([]byte) (int, error)
+		Close() error
+	}
+	conn net.Conn
+}
+
+func (b *connClosingBody) Read(p []byte) (int, error) {
+	return b.ReadCloser.Read(p)
+}
+
+func (b *connClosingBody) Close() error {
+	err := b.ReadCloser.Close()
+	if b.conn != nil {
+		b.conn.Close()
+	}
+	return err
 }
 
 func (t *chromeTransport) dialTLS(ctx context.Context, addr, host string) (net.Conn, error) {

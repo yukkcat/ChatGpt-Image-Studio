@@ -157,6 +157,30 @@ func buildAccountHeaders(accessToken string, authData map[string]any) map[string
 }
 
 func doJSONRequest(ctx context.Context, client *http.Client, method, url string, headers map[string]string, body any) (map[string]any, error) {
+	const maxRetries = 3
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(attempt) * 2 * time.Second
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+		result, err := doJSONRequestOnce(ctx, client, method, url, headers, body)
+		if err == nil {
+			return result, nil
+		}
+		lastErr = err
+		if !isRetryableError(err) {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+func doJSONRequestOnce(ctx context.Context, client *http.Client, method, url string, headers map[string]string, body any) (map[string]any, error) {
 	var reader io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
@@ -186,8 +210,11 @@ func doJSONRequest(ctx context.Context, client *http.Client, method, url string,
 	if err != nil {
 		return nil, err
 	}
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode >= 500 {
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, &nonRetryableError{msg: fmt.Sprintf("HTTP %d", resp.StatusCode)}
 	}
 
 	payload := map[string]any{}
