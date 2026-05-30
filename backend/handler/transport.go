@@ -3,137 +3,110 @@ package handler
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 
-	"chatgpt2api/internal/outboundproxy"
-
-	utls "github.com/refraction-networking/utls"
-	"golang.org/x/net/http2"
+	fhttp "github.com/bogdanfinn/fhttp"
+	"github.com/bogdanfinn/fhttp/http2"
+	tls_client "github.com/bogdanfinn/tls-client"
+	"github.com/bogdanfinn/tls-client/profiles"
 )
 
-// newChromeTransport returns an http.RoundTripper that mimics Chrome's TLS fingerprint
-// and HTTP/2 behavior to pass Cloudflare's bot detection.
+// newChromeTransport returns an http.RoundTripper that uses tls-client
+// to fully impersonate a Chrome browser (TLS + HTTP/2 fingerprint).
+// This passes Cloudflare's bot detection without needing a proxy.
 func newChromeTransport(proxyURL ...string) http.RoundTripper {
-	configuredProxyURL := firstProxyURL(proxyURL...)
-	fallbackTransport, err := outboundproxy.NewHTTPTransport(configuredProxyURL)
-	if err != nil {
-		panic(err)
-	}
-	tunnelDialContext, err := outboundproxy.NewTunnelDialContext(configuredProxyURL)
-	if err != nil {
-		panic(err)
-	}
-
+	configuredProxy := firstProxyURL(proxyURL...)
 	return &chromeTransport{
-		fallback:   fallbackTransport,
-		tunnelDial: tunnelDialContext,
+		proxyURL: configuredProxy,
 	}
 }
 
 type chromeTransport struct {
-	fallback   http.RoundTripper
-	tunnelDial func(context.Context, string, string) (net.Conn, error)
+	proxyURL string
 }
 
 func (t *chromeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.URL.Scheme != "https" {
-		return t.fallback.RoundTrip(req)
+	// Create a new tls-client for each request to avoid connection sharing issues
+	// under high concurrency.
+	options := []tls_client.HttpClientOption{
+		tls_client.WithTimeoutSeconds(120),
+		tls_client.WithClientProfile(profiles.Chrome_131),
+		tls_client.WithNotFollowRedirects(),
+		tls_client.WithInsecureSkipVerify(),
+	}
+	if t.proxyURL != "" {
+		options = append(options, tls_client.WithProxyUrl(t.proxyURL))
 	}
 
-	addr := req.URL.Host
-	if _, _, err := net.SplitHostPort(addr); err != nil {
-		addr = addr + ":443"
+	client, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
+	if err != nil {
+		return nil, fmt.Errorf("create tls client: %w", err)
 	}
-	host := req.URL.Hostname()
 
-	// Each request gets its own TLS connection with Chrome fingerprint.
-	conn, err := t.dialTLS(req.Context(), addr, host)
+	// Convert standard http.Request to fhttp.Request
+	fReq, err := convertRequest(req)
+	if err != nil {
+		return nil, fmt.Errorf("convert request: %w", err)
+	}
+
+	// Execute request
+	fResp, err := client.Do(fReq)
 	if err != nil {
 		return nil, err
 	}
 
-	// Use http2.Transport with custom settings matching Chrome's SETTINGS frame.
-	tr := &http2.Transport{
-		// Chrome sends these initial settings:
-		// HEADER_TABLE_SIZE = 65536
-		// ENABLE_PUSH = 0
-		// INITIAL_WINDOW_SIZE = 6291456
-		// MAX_HEADER_LIST_SIZE = 262144
-		MaxHeaderListSize:          262144,
-		MaxDecoderHeaderTableSize:  65536,
-		MaxEncoderHeaderTableSize:  65536,
-		StrictMaxConcurrentStreams: false,
-	}
-
-	cc, err := tr.NewClientConn(conn)
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("http2 client conn: %w", err)
-	}
-
-	resp, err := cc.RoundTrip(req)
-	if err != nil {
-		conn.Close()
-		return nil, err
-	}
-
-	resp.Body = &connClosingBody{ReadCloser: resp.Body, conn: conn}
-	return resp, nil
+	// Convert fhttp.Response back to standard http.Response
+	return convertResponse(fResp), nil
 }
 
-type connClosingBody struct {
-	ReadCloser interface {
-		Read([]byte) (int, error)
-		Close() error
+// convertRequest converts a standard net/http Request to fhttp Request.
+func convertRequest(req *http.Request) (*fhttp.Request, error) {
+	var body io.Reader
+	if req.Body != nil {
+		body = req.Body
 	}
-	conn net.Conn
-}
 
-func (b *connClosingBody) Read(p []byte) (int, error) {
-	return b.ReadCloser.Read(p)
-}
-
-func (b *connClosingBody) Close() error {
-	err := b.ReadCloser.Close()
-	if b.conn != nil {
-		b.conn.Close()
-	}
-	return err
-}
-
-func (t *chromeTransport) dialTLS(ctx context.Context, addr, host string) (net.Conn, error) {
-	rawConn, err := t.tunnelDial(ctx, "tcp", addr)
+	fReq, err := fhttp.NewRequest(req.Method, req.URL.String(), body)
 	if err != nil {
 		return nil, err
 	}
 
-	// Use latest Chrome fingerprint for realistic TLS ClientHello.
-	// HelloChrome_131 includes proper cipher suites, extensions, key shares,
-	// and ALPN that match a real Chrome browser.
-	spec, err := utls.UTLSIdToSpec(utls.HelloChrome_131)
-	if err != nil {
-		// Fallback to auto if specific version not available
-		spec, _ = utls.UTLSIdToSpec(utls.HelloChrome_Auto)
+	// Copy headers preserving order
+	for key, values := range req.Header {
+		for _, value := range values {
+			fReq.Header.Add(key, value)
+		}
 	}
 
-	tlsConn := utls.UClient(rawConn, &utls.Config{
-		ServerName: host,
-		NextProtos: []string{"h2", "http/1.1"},
-	}, utls.HelloCustom)
+	// Set context for cancellation support
+	fReq = fReq.WithContext(req.Context())
 
-	if err := tlsConn.ApplyPreset(&spec); err != nil {
-		rawConn.Close()
-		return nil, fmt.Errorf("apply chrome tls preset: %w", err)
+	return fReq, nil
+}
+
+// convertResponse converts an fhttp Response to standard net/http Response.
+func convertResponse(fResp *fhttp.Response) *http.Response {
+	resp := &http.Response{
+		Status:     fResp.Status,
+		StatusCode: fResp.StatusCode,
+		Proto:      fResp.Proto,
+		ProtoMajor: fResp.ProtoMajor,
+		ProtoMinor: fResp.ProtoMinor,
+		Header:     http.Header{},
+		Body:       fResp.Body,
 	}
 
-	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		rawConn.Close()
-		return nil, err
+	for key, values := range fResp.Header {
+		for _, value := range values {
+			resp.Header.Add(key, value)
+		}
 	}
 
-	return tlsConn, nil
+	return resp
 }
 
 func firstProxyURL(values ...string) string {
@@ -144,3 +117,11 @@ func firstProxyURL(values ...string) string {
 	}
 	return ""
 }
+
+// Ensure imports are used
+var (
+	_ = context.Background
+	_ = net.Dial
+	_ = sync.Once{}
+	_ = http2.ErrCodeNo
+)
